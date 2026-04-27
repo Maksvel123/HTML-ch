@@ -1,12 +1,10 @@
 import { NextResponse } from 'next/server';
 import * as cheerio from 'cheerio';
 import axios from 'axios';
-import Anthropic from '@anthropic-ai/sdk';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 
-// Инициализация Anthropic API
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-});
+// Инициализация Google Gemini API
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 const RULES = {
   maxLinkLength: 120, 
@@ -30,16 +28,12 @@ async function getImageSize(url) {
   }
 }
 
-// === ОПТИМИЗАЦИЯ ТОКЕНОВ (Экономия денег) ===
+// Оптимизация HTML перед отправкой в AI
 function minifyHtmlForAI(html) {
   return html
-    // Удаляем картинки в base64 (они съедают тысячи токенов)
     .replace(/src="data:image\/[^;]+;base64,[^"]+"/g, 'src="[BASE64_IMAGE_REMOVED]"')
-    // Удаляем содержимое SVG (оставляем только тег для понимания структуры)
     .replace(/<svg[^>]*>[\s\S]*?<\/svg>/g, '<svg>[SVG_REMOVED]</svg>')
-    // Удаляем HTML комментарии
     .replace(/<!--[\s\S]*?-->/g, '')
-    // Сжимаем множественные пробелы и переносы строк в один пробел
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -58,7 +52,7 @@ export async function POST(req) {
     const imagesCount = $('img').length;
     let totalImagesWeight = 0;
 
-    // 2. ХАРД-ПРАВИЛА (Бесплатные проверки Node.js)
+    // 2. ХАРД-ПРАВИЛА (Node.js)
     $('a').each((i, el) => {
       const href = $(el).attr('href') || '';
       if (href.length > RULES.maxLinkLength) {
@@ -92,7 +86,7 @@ export async function POST(req) {
             severity: 'High',
             title: 'Тяжелое изображение',
             details: `Картинка весит ${sizeKB} KB (лимит ${RULES.maxImageSizeKB} KB).`,
-            fix: 'Сожмите изображение.'
+            fix: 'Сожмите изображение перед отправкой.'
           });
         }
       }
@@ -100,9 +94,7 @@ export async function POST(req) {
 
     await Promise.all(imagePromises);
 
-    // 3. AI-ПРАВИЛА (Claude 3 Haiku - очень дешево и быстро)
-    
-    // Сжимаем HTML перед отправкой!
+    // 3. AI-ПРАВИЛА (Google Gemini)
     const optimizedHtml = minifyHtmlForAI(html);
 
     const prompt = `
@@ -112,26 +104,23 @@ export async function POST(req) {
       HTML КОД: ${optimizedHtml}
     `;
 
-    const message = await anthropic.messages.create({
-      model: "claude-3-haiku-20240307", // Заменили на самую дешевую модель
-      max_tokens: 1500,
-      temperature: 0.1,
-      system: `Ты строгий валидатор email-шаблонов. 
-      Верни СТРОГО массив JSON и больше ничего.
-      [{"severity": "High" | "Medium" | "Low", "title": "Название", "details": "Описание", "fix": "Как исправить"}]`,
-      messages: [
-        { role: "user", content: prompt }
-      ]
-    });
-
     let aiErrors = [];
     try {
-      let rawText = message.content[0].text.trim();
-      rawText = rawText.replace(/^```json/, '').replace(/```$/, '').trim();
+      const model = genAI.getGenerativeModel({ 
+        model: "gemini-1.5-flash",
+        generationConfig: {
+          responseMimeType: "application/json",
+        },
+        systemInstruction: `Ты строгий валидатор email-шаблонов. Верни СТРОГО массив JSON. Формат: [{"severity": "High" | "Medium" | "Low", "title": "Название", "details": "Описание", "fix": "Как исправить"}]`
+      });
+
+      const result = await model.generateContent(prompt);
+      const rawText = result.response.text();
+      
       aiErrors = JSON.parse(rawText);
       if (!Array.isArray(aiErrors)) aiErrors = [];
     } catch (e) {
-      console.error("Ошибка парсинга JSON от Claude:", e);
+      console.error("Ошибка генерации Gemini:", e);
     }
 
     return NextResponse.json({ results: [...errors, ...aiErrors] });
