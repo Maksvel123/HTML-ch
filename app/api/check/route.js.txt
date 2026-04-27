@@ -1,0 +1,147 @@
+import { NextResponse } from 'next/server';
+import * as cheerio from 'cheerio';
+import axios from 'axios';
+import Anthropic from '@anthropic-ai/sdk';
+
+// Инициализация Anthropic API (Ключ Claude)
+const anthropic = new Anthropic({
+  apiKey: process.env.ANTHROPIC_API_KEY,
+});
+
+// === ВАШИ ПРАВИЛА (Сюда вы будете добавлять новые) ===
+const RULES = {
+  maxLinkLength: 120, // Максимальная длина ссылки
+  maxImageSizeKB: 250, // Максимальный вес картинки (КБ)
+  aiGuidelines: [
+    "Найди устаревшие теги (например <font>, <center>, <marquee>).",
+    "Проверь соотношение текста к картинкам. Если текста мало (меньше 300 символов), а картинок много - это строгий спам-триггер.",
+    "Найди использование CSS grid или flexbox. Они плохо поддерживаются в email-клиентах, верстка должна быть табличной.",
+    "Оцени общую семантику и чистоту кода. Нет ли пустых тегов?"
+  ]
+};
+
+// Функция: узнаем вес картинки через HTTP HEAD (без скачивания)
+async function getImageSize(url) {
+  try {
+    if (!url.startsWith('http')) return 0;
+    const response = await axios.head(url, { timeout: 3000 });
+    const bytes = response.headers['content-length'];
+    return bytes ? Math.round(bytes / 1024) : 0; 
+  } catch (e) {
+    return 0; 
+  }
+}
+
+export async function POST(req) {
+  try {
+    const { html } = await req.json();
+    if (!html) return NextResponse.json({ error: 'HTML не предоставлен' }, { status: 400 });
+
+    const $ = cheerio.load(html);
+    const errors = [];
+    
+    // 1. СБОР СТАТИСТИКИ ДЛЯ AI
+    const textContent = $('body').text().replace(/\s+/g, ' ').trim();
+    const textLength = textContent.length;
+    const imagesCount = $('img').length;
+    let totalImagesWeight = 0;
+
+    // 2. ХАРД-ПРАВИЛА (Node.js)
+    $('a').each((i, el) => {
+      const href = $(el).attr('href') || '';
+      if (href.length > RULES.maxLinkLength) {
+        errors.push({
+          severity: 'Medium',
+          title: 'Слишком длинная ссылка',
+          details: `Ссылка превышает лимит в ${RULES.maxLinkLength} символов (её длина ${href.length}). Почтовые провайдеры могут посчитать это фишингом.`,
+          fix: '1. Используйте сервис сокращения ссылок.\n2. Скройте UTM-метки через серверный редирект.'
+        });
+      }
+    });
+
+    const imagePromises = $('img').map(async (i, el) => {
+      const src = $(el).attr('src') || '';
+      const alt = $(el).attr('alt');
+      
+      if (!alt) {
+        errors.push({
+          severity: 'Low',
+          title: 'Отсутствует атрибут alt',
+          details: `У картинки [${src.substring(0,40)}...] нет alt-текста.`,
+          fix: 'Добавьте атрибут alt="описание" ко всем тегам <img> в шаблоне.'
+        });
+      }
+
+      if (src) {
+        const sizeKB = await getImageSize(src);
+        totalImagesWeight += sizeKB;
+        if (sizeKB > RULES.maxImageSizeKB) {
+          errors.push({
+            severity: 'High',
+            title: 'Тяжелое изображение',
+            details: `Картинка весит ${sizeKB} KB (лимит ${RULES.maxImageSizeKB} KB). Это замедлит загрузку письма.`,
+            fix: 'Сжатие изображение через TinyPNG или сохраните в оптимизированном формате.'
+          });
+        }
+      }
+    }).get();
+
+    await Promise.all(imagePromises);
+
+    // 3. AI-ПРАВИЛА (Claude 3.5 Sonnet)
+    const prompt = `
+      Проанализируй HTML код email-шаблона.
+      
+      СТАТИСТИКА ОТ ПАРСЕРА:
+      - Символов текста: ${textLength}
+      - Количество изображений: ${imagesCount}
+      
+      ТВОИ ПРАВИЛА:
+      ${RULES.aiGuidelines.join('\n')}
+      
+      HTML КОД:
+      ${html}
+    `;
+
+    // Вызов Claude API
+    const message = await anthropic.messages.create({
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 2000,
+      temperature: 0.1, // Низкая температура для точного форматирования
+      system: `Ты строгий валидатор email-шаблонов. 
+      Твоя задача — вернуть СТРОГО валидный JSON-массив с найденными ошибками (если они есть). 
+      Никакого текста до или после JSON. Никакой markdown-разметки (без \`\`\`json).
+      Формат массива:
+      [
+        {
+          "severity": "High" | "Medium" | "Low",
+          "title": "Краткое название",
+          "details": "Подробное объяснение",
+          "fix": "Пошаговая инструкция (с новой строки)"
+        }
+      ]`,
+      messages: [
+        { role: "user", content: prompt }
+      ]
+    });
+
+    let aiErrors = [];
+    try {
+      // Очищаем ответ Claude от случайных markdown-артефактов (на всякий случай)
+      let rawText = message.content[0].text.trim();
+      rawText = rawText.replace(/^```json/, '').replace(/```$/, '').trim();
+      
+      aiErrors = JSON.parse(rawText);
+      if (!Array.isArray(aiErrors)) aiErrors = [];
+    } catch (e) {
+      console.error("Ошибка парсинга JSON от Claude:", e, "Ответ был:", message.content[0].text);
+    }
+
+    // Возвращаем склеенный массив (Хард-ошибки + Ошибки Claude)
+    return NextResponse.json({ results: [...errors, ...aiErrors] });
+
+  } catch (error) {
+    console.error(error);
+    return NextResponse.json({ error: error.message }, { status: 500 });
+  }
+}
