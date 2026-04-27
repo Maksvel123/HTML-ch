@@ -3,15 +3,14 @@ import * as cheerio from 'cheerio';
 import axios from 'axios';
 import Anthropic from '@anthropic-ai/sdk';
 
-// Инициализация Anthropic API (Ключ Claude)
+// Инициализация Anthropic API
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
 });
 
-// === ВАШИ ПРАВИЛА (Сюда вы будете добавлять новые) ===
 const RULES = {
-  maxLinkLength: 120, // Максимальная длина ссылки
-  maxImageSizeKB: 250, // Максимальный вес картинки (КБ)
+  maxLinkLength: 120, 
+  maxImageSizeKB: 250, 
   aiGuidelines: [
     "Найди устаревшие теги (например <font>, <center>, <marquee>).",
     "Проверь соотношение текста к картинкам. Если текста мало (меньше 300 символов), а картинок много - это строгий спам-триггер.",
@@ -20,7 +19,6 @@ const RULES = {
   ]
 };
 
-// Функция: узнаем вес картинки через HTTP HEAD (без скачивания)
 async function getImageSize(url) {
   try {
     if (!url.startsWith('http')) return 0;
@@ -32,6 +30,20 @@ async function getImageSize(url) {
   }
 }
 
+// === ОПТИМИЗАЦИЯ ТОКЕНОВ (Экономия денег) ===
+function minifyHtmlForAI(html) {
+  return html
+    // Удаляем картинки в base64 (они съедают тысячи токенов)
+    .replace(/src="data:image\/[^;]+;base64,[^"]+"/g, 'src="[BASE64_IMAGE_REMOVED]"')
+    // Удаляем содержимое SVG (оставляем только тег для понимания структуры)
+    .replace(/<svg[^>]*>[\s\S]*?<\/svg>/g, '<svg>[SVG_REMOVED]</svg>')
+    // Удаляем HTML комментарии
+    .replace(/<!--[\s\S]*?-->/g, '')
+    // Сжимаем множественные пробелы и переносы строк в один пробел
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 export async function POST(req) {
   try {
     const { html } = await req.json();
@@ -40,21 +52,21 @@ export async function POST(req) {
     const $ = cheerio.load(html);
     const errors = [];
     
-    // 1. СБОР СТАТИСТИКИ ДЛЯ AI
+    // 1. СБОР СТАТИСТИКИ
     const textContent = $('body').text().replace(/\s+/g, ' ').trim();
     const textLength = textContent.length;
     const imagesCount = $('img').length;
     let totalImagesWeight = 0;
 
-    // 2. ХАРД-ПРАВИЛА (Node.js)
+    // 2. ХАРД-ПРАВИЛА (Бесплатные проверки Node.js)
     $('a').each((i, el) => {
       const href = $(el).attr('href') || '';
       if (href.length > RULES.maxLinkLength) {
         errors.push({
           severity: 'Medium',
           title: 'Слишком длинная ссылка',
-          details: `Ссылка превышает лимит в ${RULES.maxLinkLength} символов (её длина ${href.length}). Почтовые провайдеры могут посчитать это фишингом.`,
-          fix: '1. Используйте сервис сокращения ссылок.\n2. Скройте UTM-метки через серверный редирект.'
+          details: `Ссылка превышает лимит в ${RULES.maxLinkLength} символов. Почтовики могут посчитать это фишингом.`,
+          fix: 'Используйте сервис сокращения ссылок.'
         });
       }
     });
@@ -68,7 +80,7 @@ export async function POST(req) {
           severity: 'Low',
           title: 'Отсутствует атрибут alt',
           details: `У картинки [${src.substring(0,40)}...] нет alt-текста.`,
-          fix: 'Добавьте атрибут alt="описание" ко всем тегам <img> в шаблоне.'
+          fix: 'Добавьте атрибут alt="описание" ко всем тегам <img>.'
         });
       }
 
@@ -79,8 +91,8 @@ export async function POST(req) {
           errors.push({
             severity: 'High',
             title: 'Тяжелое изображение',
-            details: `Картинка весит ${sizeKB} KB (лимит ${RULES.maxImageSizeKB} KB). Это замедлит загрузку письма.`,
-            fix: 'Сжатие изображение через TinyPNG или сохраните в оптимизированном формате.'
+            details: `Картинка весит ${sizeKB} KB (лимит ${RULES.maxImageSizeKB} KB).`,
+            fix: 'Сожмите изображение.'
           });
         }
       }
@@ -88,38 +100,25 @@ export async function POST(req) {
 
     await Promise.all(imagePromises);
 
-    // 3. AI-ПРАВИЛА (Claude 3.5 Sonnet)
+    // 3. AI-ПРАВИЛА (Claude 3 Haiku - очень дешево и быстро)
+    
+    // Сжимаем HTML перед отправкой!
+    const optimizedHtml = minifyHtmlForAI(html);
+
     const prompt = `
       Проанализируй HTML код email-шаблона.
-      
-      СТАТИСТИКА ОТ ПАРСЕРА:
-      - Символов текста: ${textLength}
-      - Количество изображений: ${imagesCount}
-      
-      ТВОИ ПРАВИЛА:
-      ${RULES.aiGuidelines.join('\n')}
-      
-      HTML КОД:
-      ${html}
+      СТАТИСТИКА: Символов текста: ${textLength}, Изображений: ${imagesCount}.
+      ПРАВИЛА: ${RULES.aiGuidelines.join(' ')}
+      HTML КОД: ${optimizedHtml}
     `;
 
-    // Вызов Claude API
     const message = await anthropic.messages.create({
-      model: "claude-3-5-sonnet-20241022",
-      max_tokens: 2000,
-      temperature: 0.1, // Низкая температура для точного форматирования
+      model: "claude-3-haiku-20240307", // Заменили на самую дешевую модель
+      max_tokens: 1500,
+      temperature: 0.1,
       system: `Ты строгий валидатор email-шаблонов. 
-      Твоя задача — вернуть СТРОГО валидный JSON-массив с найденными ошибками (если они есть). 
-      Никакого текста до или после JSON. Никакой markdown-разметки (без \`\`\`json).
-      Формат массива:
-      [
-        {
-          "severity": "High" | "Medium" | "Low",
-          "title": "Краткое название",
-          "details": "Подробное объяснение",
-          "fix": "Пошаговая инструкция (с новой строки)"
-        }
-      ]`,
+      Верни СТРОГО массив JSON и больше ничего.
+      [{"severity": "High" | "Medium" | "Low", "title": "Название", "details": "Описание", "fix": "Как исправить"}]`,
       messages: [
         { role: "user", content: prompt }
       ]
@@ -127,17 +126,14 @@ export async function POST(req) {
 
     let aiErrors = [];
     try {
-      // Очищаем ответ Claude от случайных markdown-артефактов (на всякий случай)
       let rawText = message.content[0].text.trim();
       rawText = rawText.replace(/^```json/, '').replace(/```$/, '').trim();
-      
       aiErrors = JSON.parse(rawText);
       if (!Array.isArray(aiErrors)) aiErrors = [];
     } catch (e) {
-      console.error("Ошибка парсинга JSON от Claude:", e, "Ответ был:", message.content[0].text);
+      console.error("Ошибка парсинга JSON от Claude:", e);
     }
 
-    // Возвращаем склеенный массив (Хард-ошибки + Ошибки Claude)
     return NextResponse.json({ results: [...errors, ...aiErrors] });
 
   } catch (error) {
