@@ -9,7 +9,7 @@
     "lint": "next lint"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.32.1",
+    "@google/generative-ai": "^0.8.0",
     "axios": "^1.6.8",
     "cheerio": "^1.0.0-rc.12",
     "lucide-react": "^0.368.0",
